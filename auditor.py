@@ -63,6 +63,7 @@ class AuditHistory(Base):
     compliance_status = Column(Boolean, nullable=False)
     json_report = Column(Text, nullable=False)
     pdf_path = Column(String, nullable=True)
+    confidence_score = Column(String, nullable=False)
 
 # create tables
 Base.metadata.create_all(bind=engine)
@@ -119,13 +120,14 @@ def generate_pdf_report(state: AuditState, filename: str) -> str:
     return filename
 
 
-def save_audit_history(original_filename: str, risk_level: str, compliance_status: bool, json_report: Dict[str, Any], pdf_path: str=None) -> AuditHistory:
+def save_audit_history(original_filename: str, risk_level: str, compliance_status: bool, confidence_score: float, json_report: Dict[str, Any], pdf_path: str=None) -> AuditHistory:
     """Persist audit results to SQLite and return the record."""
     session = SessionLocal()
     record = AuditHistory(
         original_filename=original_filename,
         risk_level=risk_level,
         compliance_status=compliance_status,
+        confidence_score=str(confidence_score),
         json_report=json.dumps(json_report, ensure_ascii=False),
         pdf_path=pdf_path
     )
@@ -210,12 +212,11 @@ def scrubbing_node(state: AuditState) -> AuditState:
     text = state.get("original_text", "")
     
     # Regex Kuralları
-    # 1. TC Kimlik No (11 hane)
+        # 1. TC Kimlik No (11 hane)
     text = re.sub(r'\b[1-9]{1}[0-9]{10}\b', 'XXXXX', text)
     
-    # 2. IBAN (TR ile başlayan 24 hane/karakter boşluksuz veya boşluklu)
-    text = re.sub(r'\bTR\d{2}\s?(?:\d{4}\s?){4}\d{2}\b', 'XXXXX', text)
-    text = re.sub(r'\bTR\d{24}\b', 'XXXXX', text)
+    # 2. IBAN (TR ile başlayan 24 hane, aralık/boşluklu veya bitişik)
+    text = re.sub(r'TR\d{2}(\s?\d{4}){5}\s?\d{2}', 'XXXXX', text)
     
     # 3. Telefon Numaraları (05XX veya +905XX formatı)
     text = re.sub(r'(?:\+90|0)?5\d{2}[-\s]?\d{3}[-\s]?\d{2}[-\s]?\d{2}', 'XXXXX', text)
