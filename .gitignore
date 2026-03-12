@@ -1,0 +1,23 @@
+# Environments
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Vector DB
+chroma_db/
+
+# Virtual Environments
+venv/
+env/
+.venv/
+.conda/
+
+# OS Files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Optional: If you don't want to push your specific PDF policies to GitHub, uncomment the line below.
+# *.pdf
