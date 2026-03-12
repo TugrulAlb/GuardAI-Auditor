@@ -21,3 +21,5 @@ env/
 
 # Optional: If you don't want to push your specific PDF policies to GitHub, uncomment the line below.
 # *.pdf
+# Audit history database
+audit_history.db
