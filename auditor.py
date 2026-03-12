@@ -13,13 +13,16 @@ from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import glob
-from datetime import datetime
+from datetime import datetime, timezone
 
-# PDF raporlaması için ReportLab
-from reportlab.pdfgen import canvas
+# PDF raporlaması için ReportLab - Paragraph & SimpleDocTemplate ile UTF-8 desteği
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+from reportlab.lib.units import inch
+from reportlab.lib import colors
 
 # SQLAlchemy imports
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, Boolean
@@ -94,61 +97,120 @@ ensure_db_schema()
 
 def generate_pdf_report(state: AuditState, filename: str) -> str:
     """Creates a PDF report from the audit state and returns the file path."""
-    # register a Unicode-supporting TrueType font (Mac path expected)
-    font_path = "/Library/Fonts/Arial.ttf"
-    try:
-        pdfmetrics.registerFont(TTFont('Arial-Turkish', font_path))
-        base_font = 'Arial-Turkish'
-    except Exception:
-        base_font = 'Helvetica'
-    # prepare paragraph styles
-    from reportlab.lib.styles import getSampleStyleSheet
+    
+    # Adım 1: Font Kaydı - Mac üzerindeki Arial.ttf dosyasını kaydet
+    font_paths = [
+        "/Library/Fonts/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf"
+    ]
+    
+    base_font = 'Helvetica'  # Fallback
+    for font_path in font_paths:
+        if os.path.exists(font_path):
+            try:
+                pdfmetrics.registerFont(TTFont('Arial-Turkish', font_path))
+                base_font = 'Arial-Turkish'
+                logger.info(f"Font kaydı başarılı: {font_path}")
+                break
+            except Exception as e:
+                logger.warning(f"Font kaydı hatası ({font_path}): {e}")
+    
+    # Adım 2: Stil Ataması - getSampleStyleSheet ile stilleri al ve fontName'ı set et
     styles = getSampleStyleSheet()
-    # explicitly set common style names to avoid numeric key errors
-    for name in ["Normal", "Heading1", "Heading2", "Title", "BodyText"]:
-        if name in styles:
-            styles[name].fontName = base_font
-    # convenience alias
-    font_name = base_font
-
-    c = canvas.Canvas(filename, pagesize=A4)
-    width, height = A4
-    c.setFont(font_name, 16)
-    c.drawCentredString(width/2, height-50, "KURUMSAL GÜVENLİK DENETİM RAPORU")
-    c.setFont(font_name, 10)
-    c.drawString(50, height-80, f"Tarih: {datetime.utcnow().isoformat()}")
+    
+    # Temel Normal stil'in fontName'ini set et (parent olarak kullanılacak)
+    styles['Normal'].fontName = base_font
+    
+    # Özel stiller oluştur (tümü Arial-Turkish veya fallback font'u kullanacak)
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Normal'],
+        fontName=base_font,
+        fontSize=16,
+        textColor=colors.HexColor('#1a1a1a'),
+        spaceAfter=12,
+        alignment=1  # Center alignment
+    )
+    
+    heading_style = ParagraphStyle(
+        'CustomHeading',
+        parent=styles['Normal'],
+        fontName=base_font,
+        fontSize=12,
+        textColor=colors.HexColor('#333333'),
+        spaceAfter=8,
+        spaceBefore=6
+    )
+    
+    body_style = ParagraphStyle(
+        'CustomBody',
+        parent=styles['Normal'],
+        fontName=base_font,
+        fontSize=10,
+        leading=14
+    )
+    
+    # Adım 3: PDF Belgesi oluştur (SimpleDocTemplate kullanarak)
+    doc = SimpleDocTemplate(
+        filename,
+        pagesize=A4,
+        rightMargin=50,
+        leftMargin=50,
+        topMargin=50,
+        bottomMargin=50
+    )
+    
+    # İçerik listesi
+    content = []
+    
+    # Title - Adım 3a: Paragraph objesi içinde başlık
+    title_text = "KURUMSAL GÜVENLİK DENETİM RAPORU"
+    content.append(Paragraph(title_text, title_style))
+    content.append(Spacer(1, 0.3*inch))
+    
+    # Tarih ve Güven Skoru
     report = state.get("audit_report", {})
     score = report.get("confidence_score", 0.0)
-    c.drawString(50, height-95, f"Güven Skoru: %{int(score*100)}")
-
-    # risk level
-    c.setFont(font_name, 12)
-    c.drawString(50, height-120, f"Risk Seviyesi: {report.get('risk_level', '')}")
-
-    # violations list
-    c.setFont(font_name, 10)
-    y = height-140
-    c.drawString(50, y, "İhlaller:")
-    for vio in report.get("violations", []):
-        y -= 15
-        c.drawString(60, y, f"- {vio}")
-        if y < 50:
-            c.showPage()
-            y = height-50
-            c.setFont(font_name, 10)
-    # scrubbed text
-    y -= 30
-    c.drawString(50, y, "Maskelenmiş Metin:")
-    y -= 15
-    text = state.get("scrubbed_text", "")
-    for line in text.split("\n"):
-        if y < 50:
-            c.showPage()
-            y = height-50
-            c.setFont(font_name, 10)
-        c.drawString(60, y, line)
-        y -= 12
-    c.save()
+    timestamp = datetime.now(timezone.utc).isoformat()
+    
+    meta_text = f"<b>Tarih:</b> {timestamp}<br/><b>Güven Skoru:</b> %{int(score*100)}"
+    content.append(Paragraph(meta_text, body_style))
+    content.append(Spacer(1, 0.2*inch))
+    
+    # Risk Seviyesi - Adım 3b: Paragraph objesi içinde
+    risk_level = report.get('risk_level', 'Bilinmiyor')
+    risk_text = f"<b>Risk Seviyesi:</b> {risk_level}"
+    content.append(Paragraph(risk_text, heading_style))
+    content.append(Spacer(1, 0.15*inch))
+    
+    # İhlaller Bölümü - Adım 3c: Paragraph objeleri ile ihlal listesi
+    violations = report.get("violations", [])
+    if violations:
+        content.append(Paragraph("İhlaller:", heading_style))
+        for vio in violations:
+            # UTF-8 desteği ile Paragraph
+            violation_text = f"• {vio}"
+            content.append(Paragraph(violation_text, body_style))
+        content.append(Spacer(1, 0.2*inch))
+    
+    # Maskelenmiş Metin Bölümü - Adım 3d: Paragraph objesi içinde
+    content.append(Paragraph("Maskelenmiş Metin:", heading_style))
+    scrubbed_text = state.get("scrubbed_text", "")
+    
+    # Metni satır satır Paragraph objelerine dönüştür
+    for line in scrubbed_text.split("\n"):
+        if line.strip():  # Boş satırları atlama
+            # UTF-8 karakterleri düzgün göster
+            content.append(Paragraph(line.replace("<", "&lt;").replace(">", "&gt;"), body_style))
+    
+    # PDF'i oluştur
+    try:
+        doc.build(content)
+        logger.info(f"PDF raporu başarıyla oluşturuldu: {filename}")
+    except Exception as e:
+        logger.error(f"PDF oluşturma hatası: {e}")
+        raise
+    
     return filename
 
 

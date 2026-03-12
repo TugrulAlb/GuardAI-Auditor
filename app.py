@@ -3,7 +3,7 @@ import os
 import tempfile
 import shutil
 from pypdf import PdfReader
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 
 # auditor.py içerisinden gerekli yapıları import edelim
@@ -222,7 +222,7 @@ with col_results:
                             st.markdown(f"*{scrubbed_text}*")
                         
                         # PDF raporu oluştur ve indirme tuşu
-                        pdf_name = f"audit_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
+                        pdf_name = f"audit_report_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.pdf"
                         pdf_path = os.path.join(tempfile.gettempdir(), pdf_name)
                         # create report file
                         generate_pdf_report(result, pdf_path)
