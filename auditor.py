@@ -65,19 +65,51 @@ class AuditHistory(Base):
     pdf_path = Column(String, nullable=True)
     confidence_score = Column(String, nullable=False)
 
-# create tables
-Base.metadata.create_all(bind=engine)
+# create tables / migration helper
+def ensure_db_schema():
+    # if table exists but missing confidence_score column, drop & recreate
+    inspector = None
+    try:
+        from sqlalchemy import inspect
+        inspector = inspect(engine)
+    except ImportError:
+        pass
+    if inspector and inspector.has_table('audit_history'):
+        cols = [c['name'] for c in inspector.get_columns('audit_history')]
+        if 'confidence_score' not in cols:
+            # recreate
+            engine.dispose()
+            if os.path.exists('audit_history.db'):
+                os.remove('audit_history.db')
+            Base.metadata.create_all(bind=engine)
+        else:
+            # nothing to do
+            pass
+    else:
+        Base.metadata.create_all(bind=engine)
+
+ensure_db_schema()
 
 # Utility functions
 
 def generate_pdf_report(state: AuditState, filename: str) -> str:
     """Creates a PDF report from the audit state and returns the file path."""
-    # register a standard UTF-8 supporting font
+    # register a Unicode-supporting TrueType font (Mac path expected)
+    font_path = "/Library/Fonts/Arial.ttf"
     try:
-        pdfmetrics.registerFont(TTFont('DejaVu', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'))
-        font_name = 'DejaVu'
+        pdfmetrics.registerFont(TTFont('Arial-Turkish', font_path))
+        base_font = 'Arial-Turkish'
     except Exception:
-        font_name = 'Helvetica'
+        base_font = 'Helvetica'
+    # prepare paragraph styles
+    from reportlab.lib.styles import getSampleStyleSheet
+    styles = getSampleStyleSheet()
+    # explicitly set common style names to avoid numeric key errors
+    for name in ["Normal", "Heading1", "Heading2", "Title", "BodyText"]:
+        if name in styles:
+            styles[name].fontName = base_font
+    # convenience alias
+    font_name = base_font
 
     c = canvas.Canvas(filename, pagesize=A4)
     width, height = A4
@@ -139,6 +171,7 @@ def save_audit_history(original_filename: str, risk_level: str, compliance_statu
 
 
 def get_history() -> list:
+    ensure_db_schema()
     session = SessionLocal()
     records = session.query(AuditHistory).order_by(AuditHistory.date.desc()).all()
     session.close()

@@ -94,6 +94,7 @@ with tab_history:
                 "date": rec.date,
                 "file": rec.original_filename,
                 "risk": rec.risk_level,
+                "confidence": rec.confidence_score,
                 "compliant": rec.compliance_status
             })
         st.dataframe(df)
@@ -103,12 +104,30 @@ with tab_history:
             st.markdown(f"**Tarih:** {rec.date}")
             st.markdown(f"**Dosya:** {rec.original_filename}")
             st.markdown(f"**Risk Seviyesi:** {rec.risk_level}")
+            st.markdown(f"**Güven Skoru:** %{int(float(rec.confidence_score)*100)}")
             st.markdown(f"**Uyumlu mu:** {rec.compliance_status}")
             st.markdown("**Rapor JSON:**")
-            st.json(json.loads(rec.json_report))
+            data = json.loads(rec.json_report)
+            st.json(data)
             if rec.pdf_path and os.path.exists(rec.pdf_path):
                 with open(rec.pdf_path, "rb") as f:
                     st.download_button("PDF Raporu İndir", f, file_name=os.path.basename(rec.pdf_path), mime="application/pdf")
+            else:
+                # regenerate PDF from stored JSON
+                if st.button("PDF'yi Yeniden Oluştur"):
+                    temp_pdf = os.path.join(tempfile.gettempdir(), f"audit_regen_{rec.id}.pdf")
+                    # build a fake state
+                    fake_state = AuditState(
+                        original_text=data.get('original_text',''),
+                        scrubbed_text=data.get('scrubbed_text',''),
+                        audit_report=data,
+                        confidence_score=float(rec.confidence_score),
+                        iteration=0,
+                        error_message=""
+                    )
+                    generate_pdf_report(fake_state, temp_pdf)
+                    with open(temp_pdf, "rb") as f2:
+                        st.download_button("Yeni PDF İndir", f2, file_name=os.path.basename(temp_pdf), mime="application/pdf")
     else:
         st.info("Henüz herhangi bir denetim kaydı yok.")
 
@@ -205,15 +224,21 @@ with col_results:
                         # PDF raporu oluştur ve indirme tuşu
                         pdf_name = f"audit_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
                         pdf_path = os.path.join(tempfile.gettempdir(), pdf_name)
+                        # create report file
                         generate_pdf_report(result, pdf_path)
-                        with open(pdf_path, "rb") as f:
-                            st.download_button("Denetim Raporunu PDF Olarak İndir", f, file_name=pdf_name, mime="application/pdf")
+                        # ensure file exists before offering download
+                        if os.path.exists(pdf_path):
+                            with open(pdf_path, "rb") as f:
+                                st.download_button("Denetim Raporunu PDF Olarak İndir", f, file_name=pdf_name, mime="application/pdf")
+                        else:
+                            st.error("PDF raporu oluşturulamadı.")
 
                         # Veritabanına kaydet
                         save_audit_history(
                             original_filename=uploaded_doc.name if 'uploaded_doc' in locals() and uploaded_doc else None,
                             risk_level=risk_level,
                             compliance_status=is_compliant,
+                            confidence_score=confidence,
                             json_report=report_data,
                             pdf_path=pdf_path
                         )
