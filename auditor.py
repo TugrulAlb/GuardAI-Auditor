@@ -13,20 +13,23 @@ from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import glob
+from datetime import datetime
+
+# PDF raporlaması için ReportLab
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+# SQLAlchemy imports
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, Boolean
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+
 from dotenv import load_dotenv
 
 # Ortam değişkenlerini yükle
 load_dotenv()
-
-# LangGraph yığınları
-from langgraph.graph import StateGraph, END
-
-# Ortam değişkenleri ve log
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Örnek OPENAI API Key (Gerçek projede .env dosyasından alınmalıdır)
-# os.environ["OPENAI_API_KEY"] = "sk-..."
 
 # ==========================================
 # 1. State Tanımları (LangGraph State Machine)
@@ -45,6 +48,112 @@ class RiskReport(BaseModel):
     violations: List[str] = Field(description="Bulunan ihlallerin listesi.")
     risk_level: str = Field(description="Risk seviyesi: Düşük, Orta, Yüksek, Kritik.")
     confidence_score: float = Field(description="Analiz güven skoru (0.0 - 1.0 arası).")
+
+# Database setup
+Base = declarative_base()
+engine = create_engine('sqlite:///audit_history.db', echo=False)
+SessionLocal = sessionmaker(bind=engine)
+
+class AuditHistory(Base):
+    __tablename__ = 'audit_history'
+    id = Column(Integer, primary_key=True, index=True)
+    date = Column(DateTime, default=datetime.utcnow)
+    original_filename = Column(String, nullable=True)
+    risk_level = Column(String, nullable=False)
+    compliance_status = Column(Boolean, nullable=False)
+    json_report = Column(Text, nullable=False)
+    pdf_path = Column(String, nullable=True)
+
+# create tables
+Base.metadata.create_all(bind=engine)
+
+# Utility functions
+
+def generate_pdf_report(state: AuditState, filename: str) -> str:
+    """Creates a PDF report from the audit state and returns the file path."""
+    # register a standard UTF-8 supporting font
+    try:
+        pdfmetrics.registerFont(TTFont('DejaVu', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'))
+        font_name = 'DejaVu'
+    except Exception:
+        font_name = 'Helvetica'
+
+    c = canvas.Canvas(filename, pagesize=A4)
+    width, height = A4
+    c.setFont(font_name, 16)
+    c.drawCentredString(width/2, height-50, "KURUMSAL GÜVENLİK DENETİM RAPORU")
+    c.setFont(font_name, 10)
+    c.drawString(50, height-80, f"Tarih: {datetime.utcnow().isoformat()}")
+    report = state.get("audit_report", {})
+    score = report.get("confidence_score", 0.0)
+    c.drawString(50, height-95, f"Güven Skoru: %{int(score*100)}")
+
+    # risk level
+    c.setFont(font_name, 12)
+    c.drawString(50, height-120, f"Risk Seviyesi: {report.get('risk_level', '')}")
+
+    # violations list
+    c.setFont(font_name, 10)
+    y = height-140
+    c.drawString(50, y, "İhlaller:")
+    for vio in report.get("violations", []):
+        y -= 15
+        c.drawString(60, y, f"- {vio}")
+        if y < 50:
+            c.showPage()
+            y = height-50
+            c.setFont(font_name, 10)
+    # scrubbed text
+    y -= 30
+    c.drawString(50, y, "Maskelenmiş Metin:")
+    y -= 15
+    text = state.get("scrubbed_text", "")
+    for line in text.split("\n"):
+        if y < 50:
+            c.showPage()
+            y = height-50
+            c.setFont(font_name, 10)
+        c.drawString(60, y, line)
+        y -= 12
+    c.save()
+    return filename
+
+
+def save_audit_history(original_filename: str, risk_level: str, compliance_status: bool, json_report: Dict[str, Any], pdf_path: str=None) -> AuditHistory:
+    """Persist audit results to SQLite and return the record."""
+    session = SessionLocal()
+    record = AuditHistory(
+        original_filename=original_filename,
+        risk_level=risk_level,
+        compliance_status=compliance_status,
+        json_report=json.dumps(json_report, ensure_ascii=False),
+        pdf_path=pdf_path
+    )
+    session.add(record)
+    session.commit()
+    session.refresh(record)
+    session.close()
+    return record
+
+
+def get_history() -> list:
+    session = SessionLocal()
+    records = session.query(AuditHistory).order_by(AuditHistory.date.desc()).all()
+    session.close()
+    return records
+
+
+# LangGraph yığınları
+from langgraph.graph import StateGraph, END
+
+# Ortam değişkenleri ve log
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Örnek OPENAI API Key (Gerçek projede .env dosyasından alınmalıdır)
+# os.environ["OPENAI_API_KEY"] = "sk-..."
+
+
 
 # ==========================================
 # 2. Vector DB (ChromaDB) Kurulumu & Veri Yükleme

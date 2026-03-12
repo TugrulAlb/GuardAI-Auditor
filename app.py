@@ -3,9 +3,18 @@ import os
 import tempfile
 import shutil
 from pypdf import PdfReader
+from datetime import datetime
+import json
 
 # auditor.py içerisinden gerekli yapıları import edelim
-from auditor import app as workflow_app, AuditState, setup_chroma
+from auditor import (
+    app as workflow_app,
+    AuditState,
+    setup_chroma,
+    generate_pdf_report,
+    save_audit_history,
+    get_history
+)
 
 # ---------------------------------------------------------
 # Sayfa Konfigürasyonu
@@ -62,13 +71,46 @@ with st.sidebar:
             st.warning("Lütfen en az bir PDF politikası yükleyin.")
 
 # ---------------------------------------------------------
-# Ana Ekran
+# Ana Ekran & Sekmeler
 # ---------------------------------------------------------
-st.title("🛡️ AI Compliance & Security Auditor")
-st.markdown("Dokümanlarınızı yükleyin veya metin girin, KVKK ve güvenlik kurallarına göre analiz edelim.")
+st.title("🛡️ AI Compliance \u0026 Security Auditor")
 
-# Düzen için iki sütun oluşturuyoruz
-col_input, col_results = st.columns([1, 1], gap="large")
+tab_new, tab_history = st.tabs(["Yeni Denetim","Eski Denetimler"])
+
+with tab_new:
+    st.markdown("Dokümanlarınızı yükleyin veya metin girin, KVKK ve güvenlik kurallarına göre analiz edelim.")
+
+    # Düzen için iki sütun oluşturuyoruz
+    col_input, col_results = st.columns([1, 1], gap="large")
+
+with tab_history:
+    st.subheader("📜 Geçmiş Denetimler")
+    history = get_history()
+    if history:
+        df = []
+        for rec in history:
+            df.append({
+                "id": rec.id,
+                "date": rec.date,
+                "file": rec.original_filename,
+                "risk": rec.risk_level,
+                "compliant": rec.compliance_status
+            })
+        st.dataframe(df)
+        sel = st.selectbox("Detayını görmek için kayıt seçin", [rec.id for rec in history])
+        if sel:
+            rec = next(r for r in history if r.id == sel)
+            st.markdown(f"**Tarih:** {rec.date}")
+            st.markdown(f"**Dosya:** {rec.original_filename}")
+            st.markdown(f"**Risk Seviyesi:** {rec.risk_level}")
+            st.markdown(f"**Uyumlu mu:** {rec.compliance_status}")
+            st.markdown("**Rapor JSON:**")
+            st.json(json.loads(rec.json_report))
+            if rec.pdf_path and os.path.exists(rec.pdf_path):
+                with open(rec.pdf_path, "rb") as f:
+                    st.download_button("PDF Raporu İndir", f, file_name=os.path.basename(rec.pdf_path), mime="application/pdf")
+    else:
+        st.info("Henüz herhangi bir denetim kaydı yok.")
 
 with col_input:
     st.subheader("📄 Denetlenecek Doküman")
@@ -159,7 +201,23 @@ with col_results:
                         # Maskelenmiş metin
                         with st.expander("Görüntüle: Maskelenmiş (Scrubbed) Metin", expanded=False):
                             st.markdown(f"*{scrubbed_text}*")
-                            
+                        
+                        # PDF raporu oluştur ve indirme tuşu
+                        pdf_name = f"audit_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
+                        pdf_path = os.path.join(tempfile.gettempdir(), pdf_name)
+                        generate_pdf_report(result, pdf_path)
+                        with open(pdf_path, "rb") as f:
+                            st.download_button("Denetim Raporunu PDF Olarak İndir", f, file_name=pdf_name, mime="application/pdf")
+
+                        # Veritabanına kaydet
+                        save_audit_history(
+                            original_filename=uploaded_doc.name if 'uploaded_doc' in locals() and uploaded_doc else None,
+                            risk_level=risk_level,
+                            compliance_status=is_compliant,
+                            json_report=report_data,
+                            pdf_path=pdf_path
+                        )
+                        
                 except Exception as e:
                     st.error(f"Uygulama Hatası: {str(e)}")
     else:
