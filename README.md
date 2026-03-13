@@ -94,13 +94,18 @@ streamlit run app.py
 
 Navigate to `http://localhost:8501` to access the web interface for interactive document auditing.
 
+## Streamlit Interface
+
+![Streamlit Interface](images/ui.png)
+
+
 ## Example Report
 
 ![Example Report](images/image.png)
 
 ## Redacted Output
 
-![Redacted Output](images/ui.png)
+![Redacted Output](images/image2.png)
 
 ## Configuration
 
