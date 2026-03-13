@@ -29,10 +29,8 @@ if 'audit_completed' not in st.session_state:
     st.session_state.audit_completed = False
 if 'audit_results' not in st.session_state:
     st.session_state.audit_results = None
-if 'uploader_key' not in st.session_state:
-    st.session_state.uploader_key = 0
-if 'policy_uploader_key' not in st.session_state:
-    st.session_state.policy_uploader_key = 0
+if 'reset_trigger' not in st.session_state:
+    st.session_state.reset_trigger = False
 
 # ---------------------------------------------------------
 # Sayfa Konfigürasyonu
@@ -42,21 +40,6 @@ st.set_page_config(
     page_icon="🛡️",
     layout="wide"
 )
-
-# Font size'ını küçültmek için CSS
-st.markdown("""
-<style>
-    .stMarkdown, .stText, .stButton button, .stSelectbox, .stRadio, .stFileUploader {
-        font-size: 14px !important;
-    }
-    .stHeader, .stSubheader {
-        font-size: 16px !important;
-    }
-    .stTitle {
-        font-size: 20px !important;
-    }
-</style>
-""", unsafe_allow_html=True)
 
 # ---------------------------------------------------------
 # Yardımcı Fonksiyonlar
@@ -105,19 +88,6 @@ def save_uploaded_file(uploaded_file, dst_path: str) -> None:
     """UploadedFile objesini belirtilen path'e kaydeder."""
     with open(dst_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
-
-def reset_app():
-    """Uygulamayı resetler: denetim verilerini temizler, politikaları korur."""
-    # Denetimle ilgili state'leri temizle
-    keys_to_clear = ['audit_completed', 'audit_results']
-    for key in keys_to_clear:
-        if key in st.session_state:
-            del st.session_state[key]
-    
-    # Uploader key'ini artır (denetlenecek doküman uploader'larını sıfırla)
-    st.session_state.uploader_key += 1
-    
-    st.rerun()
 # ---------------------------------------------------------
 # Sidebar (Yan Panel) - RAG / Politikalar
 # ---------------------------------------------------------
@@ -128,12 +98,11 @@ with st.sidebar:
     policy_files = st.file_uploader(
         "Politika PDF'lerini Seçin", 
         type=["pdf"], 
-        accept_multiple_files=True,
-        key=f"policy_uploader_{st.session_state.policy_uploader_key}"
+        accept_multiple_files=True
     )
     
-    if policy_files:
-        if st.button("Politikaları Hafızaya Al (RAG)"):
+    if st.button("Politikaları Hafızaya Al (RAG)"):
+        if policy_files:
             with st.spinner("Politikalar yükleniyor ve ChromaDB'ye kaydediliyor..."):
                 # Önceki ChromaDB'yi temizleyerek yepyeni bir bilgi tabanı oluşturalım
                 if os.path.exists("./chroma_db"):
@@ -149,8 +118,8 @@ with st.sidebar:
                     st.success("Politikalar başarıyla eklendi! RAG katmanı hazır.")
                 except Exception as e:
                     st.error(f"Hata oluştu: {str(e)}")
-    else:
-        st.warning("Lütfen en az bir PDF politikası yükleyin.")
+        else:
+            st.warning("Lütfen en az bir PDF politikası yükleyin.")
 
 # ---------------------------------------------------------
 # Ana Ekran & Sekmeler
@@ -229,7 +198,7 @@ with col_input:
         )
 
     elif input_method == "PDF Yükle":
-        uploaded_doc = st.file_uploader("Denetlenecek PDF Dosyası", type=["pdf"], key=f"pdf_uploader_{st.session_state.uploader_key}")
+        uploaded_doc = st.file_uploader("Denetlenecek PDF Dosyası", type=["pdf"])
         if uploaded_doc:
             with st.spinner("PDF okunuyor..."):
                 temp_pdf_path = os.path.join(tempfile.gettempdir(), os.path.basename(uploaded_doc.name))
@@ -253,12 +222,12 @@ with col_input:
                 ]
                 try:
                     redact_pdf(temp_pdf_path, redacted_pdf_path, patterns)
-                    st.success("Dosya güvenli hale getirildi ve indirmeye hazır")
+                    st.info("PDF başarıyla redakte edildi. (Siyah bantlı versiyon hazır)")
                 except Exception as e:
                     st.warning(f"PDF redaksiyonu sırasında hata oluştu: {e}")
 
     else:  # Resim Yükle
-        uploaded_img = st.file_uploader("Denetlenecek Resim Dosyası", type=["png", "jpg", "jpeg"], key=f"img_uploader_{st.session_state.uploader_key}")
+        uploaded_img = st.file_uploader("Denetlenecek Resim Dosyası", type=["png", "jpg", "jpeg"])
         if uploaded_img:
             with st.spinner("OCR yapılıyor..."):
                 text_to_audit, ocr_data = extract_text_from_image(uploaded_img)
@@ -288,7 +257,7 @@ with col_input:
                         save_uploaded_file(uploaded_img, temp_img_path)
                         
                         redact_image(temp_img_path, redacted_img_path, text_to_audit, patterns, ocr_data)
-                        st.success("Dosya güvenli hale getirildi ve indirmeye hazır")
+                        st.info("Resim başarıyla redakte edildi. (Siyah bantlı versiyon hazır)")
                     except Exception as e:
                         st.warning(f"Resim redaksiyonu sırasında hata oluştu: {e}")
 
@@ -299,6 +268,15 @@ with col_input:
 # ---------------------------------------------------------
 with col_results:
     st.subheader("🔍 Analiz Çıktısı")
+
+    # Reset button - en üste koy
+    if st.session_state.audit_completed:
+        if st.button("Yeni Denetleme Başlat 🔄", use_container_width=True, type="secondary"):
+            # Session state'i temizle
+            st.session_state.audit_completed = False
+            st.session_state.audit_results = None
+            st.session_state.reset_trigger = True
+            st.rerun()
 
     if start_audit or st.session_state.audit_completed:
         if not st.session_state.audit_completed:
@@ -328,63 +306,145 @@ with col_results:
                         confidence = result.get("confidence_score", 0.0)
                         error_msg = result.get("error_message", "")
 
-                        if error_msg or not report_data:
-                            # Hata durumunda session state'e kaydet
-                            st.session_state.audit_completed = True
-                            st.session_state.audit_results = {
-                                'error': error_msg or "LLM'den sonuç alınamadı.",
-                                'scrubbed_text': scrubbed_text
-                            }
+                        if error_msg:
+                            st.error(f"Denetim sırasında bir hata oluştu: {error_msg}")
+                        elif not report_data:
+                            st.error("LLM'den sonuç alınamadı.")
                         else:
-                            # Audit başarılı - verileri hazırla
                             is_compliant = report_data.get("is_compliant", False)
                             risk_level = report_data.get("risk_level", "Bilinmiyor")
                             violations = report_data.get("violations_with_reference") or report_data.get("violations", [])
                             source_docs = report_data.get("source_documents") or result.get("source_docs", [])
-                            redacted_file_path = result.get("redacted_file_path")
+                            redacted_pdf_path = result.get("redacted_pdf_path")
+                        
+                        # Güven Skoru
+                        st.metric(label="AI Güven Skoru", value=f"%{int(confidence*100)}")
+                        
+                        # Uyum & Risk
+                        if is_compliant:
+                            st.success(f"✅ Uyumlu | Risk Seviyesi: {risk_level}")
+                        else:
+                            # Risk seviyesine göre renk 
+                            if risk_level.lower() in ["kritik", "critical"]:
+                                st.error(f"❌ Uyumsuz | Risk Seviyesi: {risk_level}")
+                            elif risk_level.lower() in ["yüksek", "high"]:
+                                st.warning(f"❌ Uyumsuz | Risk Seviyesi: {risk_level}", icon="⚠️")
+                            else:
+                                st.info(f"❌ Uyumsuz | Risk Seviyesi: {risk_level}")
+                        
+                        # İhlaller (Violations)
+                        if violations:
+                            st.markdown("#### Bulunan İhlaller:")
+                            for vio in violations:
+                                if isinstance(vio, dict):
+                                    text = vio.get("text")
+                                    ref = vio.get("reference")
+                                    if ref:
+                                        st.error(f"- {text}  \n  (Referans: {ref})")
+                                    else:
+                                        st.error(f"- {text}")
+                                else:
+                                    st.error(f"- {vio}")
+                        elif is_compliant:
+                            st.info("Herhangi bir ihlal bulunamadı.")
+                            
+                        # Maskelenmiş metin
+                        with st.expander("Görüntüle: Maskelenmiş (Scrubbed) Metin", expanded=False):
+                            st.markdown(f"*{scrubbed_text}*")
+                        
+                        # Bu karara nasıl varıldı? (Kaynak Dokümanlar)
+                        if source_docs:
+                            st.markdown("#### Bu karara nasıl varıldı?")
+                            for src in source_docs:
+                                src_name = src.get("source") or "Bilinmeyen kaynak"
+                                page = src.get("page")
+                                if page:
+                                    st.markdown(f"- {src_name} (Sayfa {page})")
+                                else:
+                                    st.markdown(f"- {src_name}")
 
-                            # PDF raporu oluştur
-                            pdf_name = f"audit_report_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.pdf"
-                            pdf_path = os.path.join(tempfile.gettempdir(), pdf_name)
-                            generate_pdf_report(result, pdf_path)
+                        # Web Arama Sonuçları (Güncel Mevzuat)
+                        web_search_results = result.get("web_search_results", [])
+                        if web_search_results:
+                            st.markdown("#### 🔍 Güncel Mevzuat Taraması Sonuçları")
+                            for result_item in web_search_results:
+                                title = result_item.get("title", "")
+                                snippet = result_item.get("snippet", "")
+                                if title:
+                                    st.markdown(f"**{title}**")
+                                    if snippet:
+                                        st.markdown(f"{snippet[:200]}...")
+                                    st.markdown("---")
 
-                            # Veritabanına kaydet
-                            original_filename = None
-                            if 'uploaded_doc' in locals() and uploaded_doc:
-                                original_filename = uploaded_doc.name
-                            elif 'uploaded_img' in locals() and uploaded_img:
-                                original_filename = uploaded_img.name
+                        # Redakte edilmiş Orijinal Dosya (Siyah Bantlı)
+                        redacted_file_path = result.get("redacted_file_path")
+                        if redacted_file_path and os.path.exists(redacted_file_path):
+                            file_ext = os.path.splitext(redacted_file_path)[1].lower()
+                            if file_ext == '.pdf':
+                                with open(redacted_file_path, "rb") as f:
+                                    st.download_button(
+                                        "Karartılmış PDF İndir",
+                                        f,
+                                        file_name=os.path.basename(redacted_file_path),
+                                        mime="application/pdf"
+                                    )
+                            elif file_ext in ['.png', '.jpg', '.jpeg']:
+                                with open(redacted_file_path, "rb") as f:
+                                    mime_type = "image/png" if file_ext == '.png' else "image/jpeg"
+                                    st.download_button(
+                                        "Karartılmış Resim İndir",
+                                        f,
+                                        file_name=os.path.basename(redacted_file_path),
+                                        mime=mime_type
+                                    )
 
-                            save_audit_history(
-                                original_filename=original_filename,
-                                risk_level=risk_level,
-                                compliance_status=is_compliant,
-                                confidence_score=confidence,
-                                json_report=report_data,
-                                pdf_path=redacted_file_path or pdf_path
-                            )
+                        # PDF raporu oluştur ve indirme tuşu
+                        pdf_name = f"audit_report_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.pdf"
+                        pdf_path = os.path.join(tempfile.gettempdir(), pdf_name)
+                        # create report file
+                        generate_pdf_report(result, pdf_path)
+                        # ensure file exists before offering download
+                        if os.path.exists(pdf_path):
+                            with open(pdf_path, "rb") as f:
+                                st.download_button("Denetim Raporunu PDF Olarak İndir", f, file_name=pdf_name, mime="application/pdf")
+                        else:
+                            st.error("PDF raporu oluşturulamadı.")
 
-                            # Session state'e sonuçları kaydet
-                            st.session_state.audit_completed = True
-                            st.session_state.audit_results = {
-                                'scrubbed_text': scrubbed_text,
-                                'report_data': report_data,
-                                'confidence': confidence,
-                                'is_compliant': is_compliant,
-                                'risk_level': risk_level,
-                                'violations': violations,
-                                'source_docs': source_docs,
-                                'redacted_file_path': redacted_file_path,
-                                'web_search_results': result.get("web_search_results", []),
-                                'pdf_path': pdf_path,
-                                'original_filename': original_filename
-                            }
+                        # Veritabanına kaydet
+                        # Tarihçe kaydı için orijinal dosya adını belirle
+                        original_filename = None
+                        if 'uploaded_doc' in locals() and uploaded_doc:
+                            original_filename = uploaded_doc.name
+                        elif 'uploaded_img' in locals() and uploaded_img:
+                            original_filename = uploaded_img.name
 
-                            # Otomatik kaydırma: Analiz sonuçlarına odaklan
-                            st.markdown('<script>window.scrollTo({top: document.body.scrollHeight, behavior: "smooth"});</script>', unsafe_allow_html=True)
+                        save_audit_history(
+                            original_filename=original_filename,
+                            risk_level=risk_level,
+                            compliance_status=is_compliant,
+                            confidence_score=confidence,
+                            json_report=report_data,
+                            pdf_path=redacted_pdf_path or pdf_path
+                        )
 
-                    except Exception as e:
-                        st.error(f"Uygulama Hatası: {str(e)}")
+                        # Session state'e sonuçları kaydet
+                        st.session_state.audit_completed = True
+                        st.session_state.audit_results = {
+                            'scrubbed_text': scrubbed_text,
+                            'report_data': report_data,
+                            'confidence': confidence,
+                            'is_compliant': is_compliant,
+                            'risk_level': risk_level,
+                            'violations': violations,
+                            'source_docs': source_docs,
+                            'redacted_file_path': redacted_file_path,
+                            'web_search_results': result.get("web_search_results", []),
+                            'pdf_path': pdf_path,
+                            'original_filename': original_filename
+                        }
+
+                except Exception as e:
+                    st.error(f"Uygulama Hatası: {str(e)}")
 
         # Session state'den sonuçları göster
         if st.session_state.audit_completed and st.session_state.audit_results:
@@ -459,48 +519,33 @@ with col_results:
                             st.markdown(f"{snippet[:200]}...")
                         st.markdown("---")
 
-            # İndirme Butonları - yan yana hizala
-            col1, col2 = st.columns(2)
-
             # Redakte edilmiş Orijinal Dosya (Siyah Bantlı)
             if redacted_file_path and os.path.exists(redacted_file_path):
                 file_ext = os.path.splitext(redacted_file_path)[1].lower()
                 if file_ext == '.pdf':
                     with open(redacted_file_path, "rb") as f:
-                        with col1:
-                            st.download_button(
-                                "Siyah Bantlı Dosyayı İndir",
-                                f,
-                                file_name=os.path.basename(redacted_file_path),
-                                mime="application/pdf"
-                            )
+                        st.download_button(
+                            "Karartılmış PDF İndir",
+                            f,
+                            file_name=os.path.basename(redacted_file_path),
+                            mime="application/pdf"
+                        )
                 elif file_ext in ['.png', '.jpg', '.jpeg']:
                     with open(redacted_file_path, "rb") as f:
                         mime_type = "image/png" if file_ext == '.png' else "image/jpeg"
-                        with col1:
-                            st.download_button(
-                                "Siyah Bantlı Dosyayı İndir",
-                                f,
-                                file_name=os.path.basename(redacted_file_path),
-                                mime=mime_type
-                            )
+                        st.download_button(
+                            "Karartılmış Resim İndir",
+                            f,
+                            file_name=os.path.basename(redacted_file_path),
+                            mime=mime_type
+                        )
 
             # PDF raporu oluştur ve indirme tuşu
             if os.path.exists(pdf_path):
                 with open(pdf_path, "rb") as f:
-                    with col2:
-                        st.download_button("Raporu İndir", f, file_name=os.path.basename(pdf_path), mime="application/pdf")
+                    st.download_button("Denetim Raporunu PDF Olarak İndir", f, file_name=os.path.basename(pdf_path), mime="application/pdf")
             else:
-                with col2:
-                    st.error("PDF raporu oluşturulamadı.")
-
-            # Yeni Denetleme Başlat Butonu - en alta koy
-            if st.session_state.audit_completed:
-                st.divider()
-                if st.button("🔄 Yeni Denetleme Başlat", use_container_width=True, type="primary"):
-                    # Uploader key'i artır ve reset yap
-                    st.session_state.uploader_key += 1
-                    reset_app()
+                st.error("PDF raporu oluşturulamadı.")
 
     else:
         st.info("Sonuçları görmek için sol taraftan veri girin ve işlemi başlatın.")

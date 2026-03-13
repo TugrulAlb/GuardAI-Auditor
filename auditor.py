@@ -4,6 +4,9 @@ import os
 from typing import TypedDict, Annotated, List, Dict, Any, Optional
 import logging
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from pydantic import BaseModel, Field
 
 # LangChain yığınları
@@ -31,6 +34,9 @@ from sqlalchemy.orm import sessionmaker
 
 from dotenv import load_dotenv
 
+# Web arama için
+from langchain_community.tools import DuckDuckGoSearchRun
+
 # Ortam değişkenlerini yükle
 load_dotenv()
 
@@ -45,7 +51,8 @@ class AuditState(TypedDict):
     iteration: int              # Yeniden deneme iterasyonu (Loop önlemi)
     error_message: str          # Hata mesajı varsa
     source_docs: List[Dict[str, Any]]  # Chroma'dan gelen kaynak belge bilgileri
-    redacted_pdf_path: Optional[str]  # Redakte edilmiş (siyah bantlı) PDF yolu
+    redacted_file_path: Optional[str]  # Redakte edilmiş dosya yolu (PDF veya resim)
+    web_search_results: List[Dict[str, Any]]  # Web arama sonuçları
 
 # Structured JSON çıkışını garantilemek için Pydantic
 class RiskReport(BaseModel):
@@ -98,6 +105,7 @@ ensure_db_schema()
 # Utility functions
 
 import fitz  # PyMuPDF (PDF redaction)
+from PIL import Image, ImageDraw  # For image redaction
 
 
 def redact_pdf(input_pdf_path: str, output_pdf_path: str, patterns: List[str]) -> str:
@@ -124,6 +132,109 @@ def redact_pdf(input_pdf_path: str, output_pdf_path: str, patterns: List[str]) -
     doc.save(output_pdf_path, garbage=4, deflate=True)
     doc.close()
     return output_pdf_path
+
+
+def redact_image(input_image_path: str, output_image_path: str, text: str, patterns: List[str], ocr_data: List[Dict[str, Any]]) -> str:
+    """Redact sensitive data in an image by drawing black rectangles over OCR-detected text using bounding boxes."""
+    try:
+        # Open image
+        img = Image.open(input_image_path)
+        draw = ImageDraw.Draw(img)
+        img_width, img_height = img.size
+
+        # Convert OCR data to text for pattern matching
+        ocr_text = "".join([item['char'] for item in ocr_data])
+
+        # Find sensitive data positions using regex on OCR text
+        redaction_rects = []
+
+        for pattern in patterns:
+            try:
+                regex = re.compile(pattern, re.IGNORECASE)
+                matches = list(regex.finditer(ocr_text))
+
+                for match in matches:
+                    # Find corresponding bounding boxes for this match
+                    start_idx = match.start()
+                    end_idx = match.end()
+
+                    # Collect bounding boxes for characters in this match
+                    match_boxes = []
+                    current_idx = 0
+
+                    for item in ocr_data:
+                        char_len = len(item['char'])
+                        if current_idx >= start_idx and current_idx < end_idx:
+                            match_boxes.append(item['bbox'])
+                        current_idx += char_len
+                        if current_idx >= end_idx:
+                            break
+
+                    if match_boxes:
+                        # Create a bounding rectangle that covers all character boxes
+                        x1 = min(box[0] for box in match_boxes)
+                        y1 = min(box[1] for box in match_boxes)
+                        x2 = max(box[2] for box in match_boxes)
+                        y2 = max(box[3] for box in match_boxes)
+
+                        # Convert to PIL coordinates (Tesseract uses bottom-left origin, PIL uses top-left)
+                        pil_y1 = img_height - y2
+                        pil_y2 = img_height - y1
+
+                        redaction_rects.append((x1, pil_y1, x2, pil_y2))
+
+            except re.error:
+                # Skip invalid regex patterns
+                continue
+
+        # Apply redactions
+        for rect in redaction_rects:
+            draw.rectangle(rect, fill=(0, 0, 0))
+
+        # Save the redacted image
+        img.save(output_image_path)
+        return output_image_path
+    except Exception as e:
+        logger.error(f"Image redaction failed: {e}")
+        # Return original if redaction fails
+        return input_image_path
+
+
+def perform_web_search(query: str, max_results: int = 3) -> List[Dict[str, Any]]:
+    """Perform web search for additional context when local RAG is insufficient."""
+    try:
+        search_tool = DuckDuckGoSearchRun()
+        results = search_tool.run(query)
+
+        # Parse results (DuckDuckGo returns string, we need to structure it)
+        search_results = []
+        if results:
+            # Split by common separators and create structured results
+            lines = results.split('\n')
+            current_result = {}
+            for line in lines:
+                line = line.strip()
+                if not line:  # Skip empty lines
+                    continue
+                if line.startswith('Title:'):
+                    if current_result and current_result.get('title'):  # Only add if has title
+                        search_results.append(current_result)
+                    current_result = {'title': line.replace('Title:', '').strip(), 'link': '', 'snippet': ''}
+                elif line.startswith('Link:'):
+                    current_result['link'] = line.replace('Link:', '').strip()
+                elif line.startswith('Snippet:') or line.startswith('Description:'):
+                    current_result['snippet'] = line.replace('Snippet:', '').replace('Description:', '').strip()
+
+            if current_result and current_result.get('title'):  # Add last result
+                search_results.append(current_result)
+
+            # Filter out incomplete results
+            search_results = [r for r in search_results if r.get('title') and r.get('snippet')]
+
+        return search_results[:max_results]
+    except Exception as e:
+        logger.error(f"Web search failed: {e}")
+        return []
 
 
 def generate_pdf_report(state: AuditState, filename: str) -> str:
@@ -227,11 +338,24 @@ def generate_pdf_report(state: AuditState, filename: str) -> str:
                 content.append(Paragraph(f"• {src_name}", body_style))
         content.append(Spacer(1, 0.2*inch))
 
-    # Redakte Edilmiş PDF (Siyah Bantlı)
-    redacted_pdf_path = state.get("redacted_pdf_path")
-    if redacted_pdf_path:
-        content.append(Paragraph("Redakte Edilmiş PDF (siyah bantlı):", heading_style))
-        content.append(Paragraph(str(redacted_pdf_path), body_style))
+    # Web Arama Sonuçları
+    web_search_results = report.get("web_search_results", [])
+    if web_search_results:
+        content.append(Paragraph("Web Arama Sonuçları (Güncel Mevzuat):", heading_style))
+        for result in web_search_results:
+            title = result.get("title", "")
+            snippet = result.get("snippet", "")
+            if title:
+                content.append(Paragraph(f"• {title}", body_style))
+                if snippet:
+                    content.append(Paragraph(f"  {snippet[:200]}...", body_style))
+        content.append(Spacer(1, 0.2*inch))
+
+    # Redakte Edilmiş Dosya
+    redacted_file_path = state.get("redacted_file_path")
+    if redacted_file_path:
+        content.append(Paragraph("Redakte Edilmiş Dosya (siyah bantlı):", heading_style))
+        content.append(Paragraph(str(redacted_file_path), body_style))
         content.append(Spacer(1, 0.2*inch))
 
     # İhlaller Bölümü - Adım 3c: Paragraph objeleri ile ihlal listesi
@@ -359,19 +483,21 @@ def scrubbing_node(state: AuditState) -> AuditState:
 
     # Varsayılan değerler
     state.setdefault("source_docs", [])
-    state.setdefault("redacted_pdf_path", None)
-    
-    # Regex Kuralları
-        # 1. TC Kimlik No (11 hane)
-    text = re.sub(r'\b[1-9]{1}[0-9]{10}\b', 'XXXXX', text)
-    
-    # 2. IBAN (TR ile başlayan 24 hane, aralık/boşluklu veya bitişik)
-    text = re.sub(r'TR\d{2}(\s?\d{4}){5}\s?\d{2}', 'XXXXX', text)
-    
-    # 3. Telefon Numaraları (05XX veya +905XX formatı)
-    text = re.sub(r'(?:\+90|0)?5\d{2}[-\s]?\d{3}[-\s]?\d{2}[-\s]?\d{2}', 'XXXXX', text)
-    text = re.sub(r'\b05\d{9}\b', 'XXXXX', text)
-    
+    state.setdefault("redacted_file_path", None)
+    state.setdefault("web_search_results", [])
+
+    # Kapsamlı maskeleme (Scrubber) - Hassas verileri gizle
+    # TCKN (11 haneli)
+    text = re.sub(r'\b\d{11}\b', 'XXXXXXXXXXX', text)
+    # IBAN
+    text = re.sub(r'TR\d{2}(?:\s?\d{4}){5}\s?\d{2}', 'TRXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX', text)
+    # Telefon
+    text = re.sub(r'(?:\+?90|0)?\s*[1-9]\d{2}\s*\d{3}\s*\d{2}\s*\d{2}', '0XXXXXXXXXX', text)
+    # E-posta
+    text = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', 'XXXX@XXXX.XXX', text)
+    # Adres bilgileri (basit pattern)
+    text = re.sub(r'\b\d{5}\s+[A-ZÇĞİÖŞÜ\s]+/[A-ZÇĞİÖŞÜ\s]+\b', 'XXXXX XXXXXXXX/XXXXXXXX', text)
+
     state["scrubbed_text"] = text
     return state
 
@@ -442,6 +568,51 @@ DENETLENECEK DOKÜMAN:
         response = llm.invoke(prompt)
         report_data = json.loads(response.content)
 
+        # Web arama: Eğer rapor belirsiz kurallar içeriyorsa veya güncel mevzuat gerekiyorsa
+        web_search_results = []
+        if report_data.get("confidence_score", 0.0) < 0.8 or "güncel" in text_to_audit.lower() or "2026" in text_to_audit.lower() or "mevzuat" in text_to_audit.lower():
+            logger.info("--- Web arama yapılıyor: Güncel mevzuat bilgileri aranıyor ---")
+            search_queries = []
+
+            # Metindeki potansiyel arama terimleri - daha kapsamlı
+            text_lower = text_to_audit.lower()
+            if "ceza" in text_lower or "cezalandırma" in text_lower:
+                search_queries.append("2026 KVKK cezaları güncel miktarları")
+                search_queries.append("KVKK veri ihlali cezaları 2026")
+            if "ihlal" in text_lower or "ihlaller" in text_lower:
+                search_queries.append("KVKK veri ihlali cezaları ve yaptırımlar")
+                search_queries.append("2026 KVKK ihlal türleri")
+            if "güncel" in text_lower or "mevzuat" in text_lower:
+                search_queries.append("2026 KVKK mevzuatı güncel değişiklikler")
+                search_queries.append("KVKK 6698 sayılı kanun güncel hali")
+            if "veri" in text_lower and "işleme" in text_lower:
+                search_queries.append("KVKK veri işleme şartları 2026")
+            if "açık rıza" in text_lower or "rıza" in text_lower:
+                search_queries.append("KVKK açık rıza şartları 2026")
+            if "veri güvenliği" in text_lower or "güvenlik" in text_lower:
+                search_queries.append("KVKK veri güvenliği tedbirleri")
+
+            # Varsayılan arama - daha spesifik
+            if not search_queries:
+                search_queries.append("2026 KVKK mevzuatı güncel değişiklikler ve cezalar")
+
+            for query in search_queries[:2]:  # Maksimum 2 arama
+                results = perform_web_search(query, max_results=2)
+                web_search_results.extend(results)
+
+        # Web arama sonuçlarını rapora ekle
+        if web_search_results:
+            report_data["web_search_results"] = web_search_results
+            # Web sonuçlarını policy_context'e ekle
+            web_context = "\n\nWEB ARAMA SONUÇLARI (Güncel Mevzuat):\n"
+            for result in web_search_results:
+                web_context += f"- {result.get('title', '')}: {result.get('snippet', '')}\n"
+            policy_context += web_context
+
+            # Güven skoru web arama ile arttıysa güncelle
+            if report_data.get("confidence_score", 0.0) < 0.9:
+                report_data["confidence_score"] = min(0.9, report_data.get("confidence_score", 0.0) + 0.1)
+
         # Kaynak dokümanları rapora ekle
         report_data["source_documents"] = source_docs
 
@@ -458,6 +629,10 @@ DENETLENECEK DOKÜMAN:
                     ref = f"{src_str} (sayfa {page})"
                 elif src_str:
                     ref = f"{src_str}"
+            elif web_search_results:
+                # Web arama sonucu varsa referans olarak kullan
+                web_ref = web_search_results[idx % len(web_search_results)]
+                ref = f"Web: {web_ref.get('title', 'Güncel Mevzuat')}"
             violations_with_ref.append({
                 "text": vio,
                 "reference": ref
@@ -469,6 +644,7 @@ DENETLENECEK DOKÜMAN:
         state["confidence_score"] = float(report_data.get("confidence_score", 0.0))
         state["iteration"] = iteration + 1
         state["source_docs"] = source_docs
+        state["web_search_results"] = web_search_results
     except Exception as e:
         logger.error(f"Audit Node'da bir hata oluştu: {str(e)}")
         state["error_message"] = str(e)
@@ -476,6 +652,7 @@ DENETLENECEK DOKÜMAN:
     finally:
         # Kaynak doküman bilgilerini state'e ekle (boş kalsa da)
         state["source_docs"] = source_docs
+        state["web_search_results"] = web_search_results
 
     return state
 
