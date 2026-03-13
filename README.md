@@ -107,6 +107,11 @@ Navigate to `http://localhost:8501` to access the web interface for interactive 
 
 ![Redacted Output](images/image2.png)
 
+## Comprehensive Compliance & Security Audit Report
+
+![Comprehensive Compliance & Security Audit Report](images/report.png)
+
+
 ## Configuration
 
 ### Environment Variables
