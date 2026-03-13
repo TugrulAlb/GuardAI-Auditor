@@ -6,6 +6,10 @@ from pypdf import PdfReader
 from datetime import datetime, timezone
 import json
 
+from PIL import Image
+
+import pytesseract
+
 # auditor.py içerisinden gerekli yapıları import edelim
 from auditor import (
     app as workflow_app,
@@ -13,7 +17,8 @@ from auditor import (
     setup_chroma,
     generate_pdf_report,
     save_audit_history,
-    get_history
+    get_history,
+    redact_pdf
 )
 
 # ---------------------------------------------------------
@@ -37,6 +42,26 @@ def extract_text_from_pdf(file) -> str:
             text += page.extract_text() + "\\n"
     return text
 
+def extract_text_from_image(image_bytes) -> str:
+    """Resim dosyasından OCR ile metin çıkarır."""
+    try:
+        img = Image.open(image_bytes)
+        # Türkçe dil desteği varsa, 'tur' dil kodunu kullan (Tesseract kurulumu gerektirir)
+        try:
+            text = pytesseract.image_to_string(img, lang="tur")
+        except Exception:
+            # Eğer Türkçe dili yüklü değilse varsayılan dili kullan
+            text = pytesseract.image_to_string(img)
+        return text
+    except Exception as e:
+        st.error(f"OCR sırasında hata oluştu: {e}")
+        return ""
+
+
+def save_uploaded_file(uploaded_file, dst_path: str) -> None:
+    """UploadedFile objesini belirtilen path'e kaydeder."""
+    with open(dst_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
 # ---------------------------------------------------------
 # Sidebar (Yan Panel) - RAG / Politikalar
 # ---------------------------------------------------------
@@ -134,25 +159,59 @@ with tab_history:
 with col_input:
     st.subheader("📄 Denetlenecek Doküman")
     
-    input_method = st.radio("Veri Giriş Yöntemi", ["Metin Gir", "PDF Yükle"], horizontal=True)
+    input_method = st.radio("Veri Giriş Yöntemi", ["Metin Gir", "PDF Yükle", "Resim Yükle"], horizontal=True)
     
     text_to_audit = ""
-    
+    redacted_pdf_path = None
+
     if input_method == "Metin Gir":
         text_to_audit = st.text_area(
             "Denetlenecek metni buraya yapıştırın",
             height=300,
             placeholder="Müşteri Ahmet Yılmaz'ın sipariş teyidi alındı. İletişim: 05551234567..."
         )
-    else:
+
+    elif input_method == "PDF Yükle":
         uploaded_doc = st.file_uploader("Denetlenecek PDF Dosyası", type=["pdf"])
         if uploaded_doc:
             with st.spinner("PDF okunuyor..."):
-                text_to_audit = extract_text_from_pdf(uploaded_doc)
+                temp_pdf_path = os.path.join(tempfile.gettempdir(), os.path.basename(uploaded_doc.name))
+                save_uploaded_file(uploaded_doc, temp_pdf_path)
+
+                text_to_audit = extract_text_from_pdf(temp_pdf_path)
                 st.success("PDF başarıyla okundu!")
                 with st.expander("Okunan Orijinal Metin"):
                     st.write(text_to_audit)
-                
+
+                # PDF üzerinde hassas verileri kırparak redakte et
+                redacted_pdf_path = os.path.join(
+                    tempfile.gettempdir(),
+                    f"redacted_{os.path.basename(uploaded_doc.name)}"
+                )
+                patterns = [
+                    r"\b[1-9][0-9]{10}\b",  # TCKN
+                    r"TR\d{2}(?:\s?\d{4}){5}\s?\d{2}",  # IBAN
+                    r"(?:\+90|0)?5\d{2}[-\s]?\d{3}[-\s]?\d{2}[-\s]?\d{2}",  # Telefon
+                    r"\b05\d{9}\b"
+                ]
+                try:
+                    redact_pdf(temp_pdf_path, redacted_pdf_path, patterns)
+                    st.info("PDF başarıyla redakte edildi. (Siyah bantlı versiyon hazır)")
+                except Exception as e:
+                    st.warning(f"PDF redaksiyonu sırasında hata oluştu: {e}")
+
+    else:  # Resim Yükle
+        uploaded_img = st.file_uploader("Denetlenecek Resim Dosyası", type=["png", "jpg", "jpeg"])
+        if uploaded_img:
+            with st.spinner("OCR yapılıyor..."):
+                text_to_audit = extract_text_from_image(uploaded_img)
+                if text_to_audit.strip():
+                    st.success("OCR başarıyla tamamlandı!")
+                else:
+                    st.warning("OCR'dan metin alınamadı. Lütfen daha net bir resim deneyin.")
+                with st.expander("OCR ile çıkarılan metin"):
+                    st.write(text_to_audit)
+
     start_audit = st.button("Denetimi Başlat 🚀", use_container_width=True, type="primary")
 
 # ---------------------------------------------------------
@@ -172,7 +231,9 @@ with col_results:
                     audit_report={},
                     confidence_score=0.0,
                     iteration=0,
-                    error_message=""
+                    error_message="",
+                    source_docs=[],
+                    redacted_pdf_path=redacted_pdf_path
                 )
                 
                 # Langgraph'ı çalıştır
@@ -192,7 +253,9 @@ with col_results:
                     else:
                         is_compliant = report_data.get("is_compliant", False)
                         risk_level = report_data.get("risk_level", "Bilinmiyor")
-                        violations = report_data.get("violations", [])
+                        violations = report_data.get("violations_with_reference") or report_data.get("violations", [])
+                        source_docs = report_data.get("source_documents") or result.get("source_docs", [])
+                        redacted_pdf_path = result.get("redacted_pdf_path")
                         
                         # Güven Skoru
                         st.metric(label="AI Güven Skoru", value=f"%{int(confidence*100)}")
@@ -213,7 +276,15 @@ with col_results:
                         if violations:
                             st.markdown("#### Bulunan İhlaller:")
                             for vio in violations:
-                                st.error(f"- {vio}")
+                                if isinstance(vio, dict):
+                                    text = vio.get("text")
+                                    ref = vio.get("reference")
+                                    if ref:
+                                        st.error(f"- {text}  \n  (Referans: {ref})")
+                                    else:
+                                        st.error(f"- {text}")
+                                else:
+                                    st.error(f"- {vio}")
                         elif is_compliant:
                             st.info("Herhangi bir ihlal bulunamadı.")
                             
@@ -221,6 +292,27 @@ with col_results:
                         with st.expander("Görüntüle: Maskelenmiş (Scrubbed) Metin", expanded=False):
                             st.markdown(f"*{scrubbed_text}*")
                         
+                        # Bu karara nasıl varıldı? (Kaynak Dokümanlar)
+                        if source_docs:
+                            st.markdown("#### Bu karara nasıl varıldı?")
+                            for src in source_docs:
+                                src_name = src.get("source") or "Bilinmeyen kaynak"
+                                page = src.get("page")
+                                if page:
+                                    st.markdown(f"- {src_name} (Sayfa {page})")
+                                else:
+                                    st.markdown(f"- {src_name}")
+
+                        # Redakte edilmiş Orijinal PDF (Siyah Bantlı)
+                        if redacted_pdf_path and os.path.exists(redacted_pdf_path):
+                            with open(redacted_pdf_path, "rb") as f:
+                                st.download_button(
+                                    "Redakte Edilmiş PDF İndir",
+                                    f,
+                                    file_name=os.path.basename(redacted_pdf_path),
+                                    mime="application/pdf"
+                                )
+
                         # PDF raporu oluştur ve indirme tuşu
                         pdf_name = f"audit_report_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.pdf"
                         pdf_path = os.path.join(tempfile.gettempdir(), pdf_name)
@@ -234,13 +326,20 @@ with col_results:
                             st.error("PDF raporu oluşturulamadı.")
 
                         # Veritabanına kaydet
+                        # Tarihçe kaydı için orijinal dosya adını belirle
+                        original_filename = None
+                        if 'uploaded_doc' in locals() and uploaded_doc:
+                            original_filename = uploaded_doc.name
+                        elif 'uploaded_img' in locals() and uploaded_img:
+                            original_filename = uploaded_img.name
+
                         save_audit_history(
-                            original_filename=uploaded_doc.name if 'uploaded_doc' in locals() and uploaded_doc else None,
+                            original_filename=original_filename,
                             risk_level=risk_level,
                             compliance_status=is_compliant,
                             confidence_score=confidence,
                             json_report=report_data,
-                            pdf_path=pdf_path
+                            pdf_path=redacted_pdf_path or pdf_path
                         )
                         
                 except Exception as e:

@@ -11,3 +11,7 @@ pypdf2>=3.0.1
 python-dotenv>=1.0.0
 reportlab>=3.7.0
 sqlalchemy>=2.0.0
+pillow>=10.0.0
+pytesseract>=0.3.10
+pymupdf>=1.22.0
+easyocr>=1.6.0

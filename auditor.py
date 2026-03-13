@@ -1,7 +1,7 @@
 import json
 import re
 import os
-from typing import TypedDict, Annotated, List, Dict, Any
+from typing import TypedDict, Annotated, List, Dict, Any, Optional
 import logging
 
 from pydantic import BaseModel, Field
@@ -44,6 +44,8 @@ class AuditState(TypedDict):
     confidence_score: float     # LLM'in analizdeki güven skoru
     iteration: int              # Yeniden deneme iterasyonu (Loop önlemi)
     error_message: str          # Hata mesajı varsa
+    source_docs: List[Dict[str, Any]]  # Chroma'dan gelen kaynak belge bilgileri
+    redacted_pdf_path: Optional[str]  # Redakte edilmiş (siyah bantlı) PDF yolu
 
 # Structured JSON çıkışını garantilemek için Pydantic
 class RiskReport(BaseModel):
@@ -94,6 +96,35 @@ def ensure_db_schema():
 ensure_db_schema()
 
 # Utility functions
+
+import fitz  # PyMuPDF (PDF redaction)
+
+
+def redact_pdf(input_pdf_path: str, output_pdf_path: str, patterns: List[str]) -> str:
+    """Redact sensitive data in a PDF by drawing black rectangles over matches.
+
+    Patterns should be regular expressions used to locate sensitive text.
+    """
+    doc = fitz.open(input_pdf_path)
+    for page in doc:
+        for pattern in patterns:
+            try:
+                matches = page.search_for(pattern, regex=True)
+            except Exception:
+                # fallback: non-regex search
+                matches = page.search_for(pattern)
+            for rect in matches:
+                # Add a redaction annotation filled with black
+                page.add_redact_annot(rect, fill=(0, 0, 0))
+        # Apply all redactions on this page (safely callable even if none)
+        try:
+            page.apply_redactions()
+        except Exception:
+            pass
+    doc.save(output_pdf_path, garbage=4, deflate=True)
+    doc.close()
+    return output_pdf_path
+
 
 def generate_pdf_report(state: AuditState, filename: str) -> str:
     """Creates a PDF report from the audit state and returns the file path."""
@@ -182,7 +213,27 @@ def generate_pdf_report(state: AuditState, filename: str) -> str:
     risk_text = f"<b>Risk Seviyesi:</b> {risk_level}"
     content.append(Paragraph(risk_text, heading_style))
     content.append(Spacer(1, 0.15*inch))
-    
+
+    # Kaynak Dokümanlar - Referans
+    source_docs = report.get("source_documents", [])
+    if source_docs:
+        content.append(Paragraph("Kaynak Dokümanlar:", heading_style))
+        for src in source_docs:
+            src_name = src.get("source") or "Bilinmeyen kaynak"
+            page = src.get("page")
+            if page:
+                content.append(Paragraph(f"• {src_name} (Sayfa {page})", body_style))
+            else:
+                content.append(Paragraph(f"• {src_name}", body_style))
+        content.append(Spacer(1, 0.2*inch))
+
+    # Redakte Edilmiş PDF (Siyah Bantlı)
+    redacted_pdf_path = state.get("redacted_pdf_path")
+    if redacted_pdf_path:
+        content.append(Paragraph("Redakte Edilmiş PDF (siyah bantlı):", heading_style))
+        content.append(Paragraph(str(redacted_pdf_path), body_style))
+        content.append(Spacer(1, 0.2*inch))
+
     # İhlaller Bölümü - Adım 3c: Paragraph objeleri ile ihlal listesi
     violations = report.get("violations", [])
     if violations:
@@ -305,6 +356,10 @@ def scrubbing_node(state: AuditState) -> AuditState:
     """
     logger.info("--- NODE: ScrubbingNode Çalışıyor ---")
     text = state.get("original_text", "")
+
+    # Varsayılan değerler
+    state.setdefault("source_docs", [])
+    state.setdefault("redacted_pdf_path", None)
     
     # Regex Kuralları
         # 1. TC Kimlik No (11 hane)
@@ -331,10 +386,19 @@ def audit_node(state: AuditState) -> AuditState:
     iteration = state.get("iteration", 0)
     
     # 1. RAG ile Kuralları Çek
+    source_docs: List[Dict[str, Any]] = []
     try:
         vectorstore = setup_chroma()
         retrieved_docs = vectorstore.similarity_search(text_to_audit, k=2)
-        policy_context = "\\n".join([doc.page_content for doc in retrieved_docs])
+        policy_context = "\n".join([doc.page_content for doc in retrieved_docs])
+
+        # Kaynak dokümanları (metadata) sakla
+        for doc in retrieved_docs:
+            metadata = getattr(doc, "metadata", {}) or {}
+            source_docs.append({
+                "source": metadata.get("source") or metadata.get("sourcefile") or metadata.get("file_name") or "",
+                "page": metadata.get("page") or metadata.get("page_number") or metadata.get("page_num") or None,
+            })
     except Exception as e:
         logger.warning(f"ChromaDB başlatılamadı veya boş, örnek politikalar kullanılmadan devam ediliyor... ({e})")
         policy_context = "Genel KVKK veri koruma ilkeleri zorunludur."
@@ -377,14 +441,42 @@ DENETLENECEK DOKÜMAN:
     try:
         response = llm.invoke(prompt)
         report_data = json.loads(response.content)
+
+        # Kaynak dokümanları rapora ekle
+        report_data["source_documents"] = source_docs
+
+        # Violations listesi varsa, her birine kaynak bilgisi ekle
+        violations = report_data.get("violations", []) or []
+        violations_with_ref = []
+        for idx, vio in enumerate(violations):
+            ref = None
+            if source_docs:
+                src = source_docs[idx % len(source_docs)]
+                src_str = src.get("source", "")
+                page = src.get("page")
+                if page is not None and page != "":
+                    ref = f"{src_str} (sayfa {page})"
+                elif src_str:
+                    ref = f"{src_str}"
+            violations_with_ref.append({
+                "text": vio,
+                "reference": ref
+            })
+        report_data["violations_with_reference"] = violations_with_ref
+
+        # State'i güncelle
         state["audit_report"] = report_data
         state["confidence_score"] = float(report_data.get("confidence_score", 0.0))
         state["iteration"] = iteration + 1
+        state["source_docs"] = source_docs
     except Exception as e:
         logger.error(f"Audit Node'da bir hata oluştu: {str(e)}")
         state["error_message"] = str(e)
         state["confidence_score"] = 0.0
-        
+    finally:
+        # Kaynak doküman bilgilerini state'e ekle (boş kalsa da)
+        state["source_docs"] = source_docs
+
     return state
 
 # ==========================================
